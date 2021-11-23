@@ -33,6 +33,11 @@ namespace AspNetCoreVerifiableCredentials
 
         public string IssuerAuthority { get; set; }
 
+        /// <summary>
+        /// The type of the credential to issue and verify 
+        /// </summary>
+        public string CredentialType { get; set; }
+
         public string VerifierAuthority { get; set; }
         /// <summary>
         /// The Tenant is:

@@ -22,9 +22,6 @@ namespace AspNetCoreVerifiableCredentials
     [Route("api/[controller]/[action]")]
     public class VerifierController : Controller
     {
-        const string PRESENTATIONPAYLOAD = "presentation_request_config.json";
-        //        const string PRESENTATIONPAYLOAD = "presentation_request_config - TrueIdentitySample.json";
-
         protected readonly AppSettingsModel AppSettings;
         protected IMemoryCache _cache;
         protected readonly ILogger<VerifierController> _log;
@@ -47,62 +44,36 @@ namespace AspNetCoreVerifiableCredentials
         {
             try
             {
-
                 string jsonString = null;
-                //they payload template is loaded from disk and modified in the code below to make it easier to get started
-                //and having all config in a central location appsettings.json. 
-                //if you want to manually change the payload in the json file make sure you comment out the code below which will modify it automatically
-                //
-                string payloadpath = Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetEntryAssembly().Location), PRESENTATIONPAYLOAD);
-                _log.LogTrace("IssuanceRequest file: {0}", payloadpath);
-                if (!System.IO.File.Exists(payloadpath))
-                {
-                    _log.LogError("File not found: {0}", payloadpath);
-                    return BadRequest(new { error = "400", error_description = PRESENTATIONPAYLOAD + " not found" });
-                }
-                jsonString = System.IO.File.ReadAllText(payloadpath);
-                if (string.IsNullOrEmpty(jsonString))
-                {
-                    _log.LogError("Error reading file: {0}", payloadpath);
-                    return BadRequest(new { error = "400", error_description = PRESENTATIONPAYLOAD + " error reading file" });
-                }
 
-                string state = Guid.NewGuid().ToString();
+                PresentationRequestModel payload = new PresentationRequestModel();
 
-                //modify payload with new state, the state is used to be able to update the UI when callbacks are received from the VC Service
-                JObject payload = JObject.Parse(jsonString);
-                if (payload["callback"]["state"] != null)
-                {
-                    payload["callback"]["state"] = state;
-                }
+                // The state is used to be able to update the UI when callbacks are received from the VC Service
+                payload.Callback.State = Guid.NewGuid().ToString();
 
-                //get the VerifierDID from the appsettings
-                if (payload["authority"] != null)
-                {
-                    payload["authority"] = AppSettings.VerifierAuthority;
-                }
+                // Get the IssuerDID from the appsettings
+                payload.Authority = AppSettings.VerifierAuthority;
 
-                //copy the issuerDID from the settings and fill in the trustedIssuer part of the payload
-                //this means only that issuer should be trusted for the requested credentialtype
-                //this value is an array in the payload, you can trust multiple issuers for the same credentialtype
-                //very common to accept the test VCs and the Production VCs coming from different verifiable credential services
-                if (payload["presentation"]["requestedCredentials"][0]["acceptedIssuers"][0] != null)
-                {
-                    payload["presentation"]["requestedCredentials"][0]["acceptedIssuers"][0] = AppSettings.IssuerAuthority;
-                }
+                // Copy the issuerDID from the settings and fill in the trustedIssuer part of the payload.
+                // This means only that issuer should be trusted for the requested credential type.
+                // This value is an array in the payload, you can trust multiple issuers for the same credential types.
+                // It's very common to accept the test VCs and the Production VCs coming from different verifiable credential services
+                payload.Presentation.RequestedCredentials.Add(new RequestCredential());
+                payload.Presentation.RequestedCredentials[0].AcceptedIssuers.Add(AppSettings.IssuerAuthority);
+                payload.Presentation.RequestedCredentials[0].Type = AppSettings.CredentialType;
+                payload.Presentation.RequestedCredentials[0].Purpose = "So we can see that you a veritable credentials expert";
 
-                //modify the callback method to make it easier to debug with tools like ngrok since the URI changes all the time
-                //this way you don't need to modify the callback URL in the payload every time ngrok changes the URI
-                if (payload["callback"]["url"] != null)
+                // Add the registration information
+                payload.Registration.ClientName = "Veritable Credential Expert Verifier";
+                payload.Registration.Purpose = "So we can see that you a veritable credentials expert";
+
+                // Localhost hostname can't work for callbacks so we won't overwrite it.
+                // This happens for example when testing with sign-in to an IDP and https://localhost is used as redirect URI.
+                // In that case the callback should be configured in the payload directly instead of being modified in the code here
+                string host = GetRequestHostName();
+                if (!host.Contains("//localhost"))
                 {
-                    //localhost hostname can't work for callbacks so we won't overwrite it.
-                    //this happens for example when testing with sign-in to an IDP and https://localhost is used as redirect URI
-                    //in that case the callback should be configured in the payload directly instead of being modified in the code here
-                    string host = GetRequestHostName();
-                    if (!host.Contains("//localhost"))
-                    {
-                        payload["callback"]["url"] = String.Format("{0}:/api/verifier/presentationCallback", host);
-                    }
+                    payload.Callback.Url = String.Format("{0}:/api/verifier/presentationCallback", host);
                 }
 
                 jsonString = JsonConvert.SerializeObject(payload);
@@ -112,7 +83,7 @@ namespace AspNetCoreVerifiableCredentials
                 string response = null;
                 try
                 {
-                    //The VC Request API is an authenticated API. We need to clientid and secret (or certificate) to create an access token which 
+                    //The VC Request API is an authenticated API. We need to client ID and secret (or certificate) to create an access token which 
                     //needs to be send as bearer to the VC Request API
                     var accessToken = await GetAccessToken();
                     if (accessToken.Item1 == String.Empty)
@@ -127,13 +98,13 @@ namespace AspNetCoreVerifiableCredentials
 
                     HttpResponseMessage res = await client.PostAsync(AppSettings.ApiEndpoint, new StringContent(jsonString, Encoding.UTF8, "application/json"));
                     response = await res.Content.ReadAsStringAsync();
-                    _log.LogTrace("succesfully called Request API");
+                    _log.LogTrace("Successfully called Request API");
                     statusCode = res.StatusCode;
 
                     if (statusCode == HttpStatusCode.Created)
                     {
                         JObject requestConfig = JObject.Parse(response);
-                        requestConfig.Add(new JProperty("id", state));
+                        requestConfig.Add(new JProperty("id", payload.Callback.State));
                         jsonString = JsonConvert.SerializeObject(requestConfig);
 
                         //We use in memory cache to keep state about the request. The UI will check the state when calling the presentationResponse method
@@ -144,7 +115,7 @@ namespace AspNetCoreVerifiableCredentials
                             message = "Request ready, please scan with Authenticator",
                             expiry = requestConfig["expiry"].ToString()
                         };
-                        _cache.Set(state, JsonConvert.SerializeObject(cacheData));
+                        _cache.Set(payload.Callback.State, JsonConvert.SerializeObject(cacheData));
 
                         //the response from the VC Request API call is returned to the caller (the UI). It contains the URI to the request which Authenticator can download after
                         //it has scanned the QR code. If the payload requested the VC Request service to create the QR code that is returned as well
@@ -154,7 +125,7 @@ namespace AspNetCoreVerifiableCredentials
                     }
                     else
                     {
-                        _log.LogError("Unsuccesfully called Request API");
+                        _log.LogError("Unsuccessfully called Request API");
                         return BadRequest(new { error = "400", error_description = "Something went wrong calling the API: " + response });
                     }
                 }
@@ -204,16 +175,30 @@ namespace AspNetCoreVerifiableCredentials
                 // In this case the result is put in the in memory cache which is used by the UI when polling for the state so the UI can be updated.
                 if (presentationResponse["code"].ToString() == "presentation_verified")
                 {
+                    string email = "", firstName = "", lastName = "";
+
+                    if (presentationResponse["issuers"][0]["claims"]["email"] != null)
+                        email = presentationResponse["issuers"][0]["claims"]["email"].ToString();
+
+
+                    if (presentationResponse["issuers"][0]["claims"]["firstName"] != null)
+                        firstName = presentationResponse["issuers"][0]["claims"]["firstName"].ToString();
+
+
+                    if (presentationResponse["issuers"][0]["claims"]["lastName"] != null)
+                        lastName = presentationResponse["issuers"][0]["claims"]["lastName"].ToString();
+
                     var cacheData = new
                     {
                         status = "presentation_verified",
-                        message = "Presentation verified",
+                        message = "Presentation received",
                         payload = presentationResponse["issuers"].ToString(),
                         subject = presentationResponse["subject"].ToString(),
-                        firstName = presentationResponse["issuers"][0]["claims"]["firstName"].ToString(),
-                        lastName = presentationResponse["issuers"][0]["claims"]["lastName"].ToString()
-
+                        email = email,
+                        firstName = firstName,
+                        lastName = lastName,
                     };
+
                     _cache.Set(state, JsonConvert.SerializeObject(cacheData));
 
                 }
@@ -227,7 +212,7 @@ namespace AspNetCoreVerifiableCredentials
         }
         //
         //this function is called from the UI polling for a response from the AAD VC Service.
-        //when a callback is recieved at the presentationCallback service the session will be updated
+        //when a callback is received at the presentationCallback service the session will be updated
         //this method will respond with the status so the UI can reflect if the QR code was scanned and with the result of the presentation
         //
         [HttpGet("/api/verifier/presentation-response")]
@@ -236,8 +221,8 @@ namespace AspNetCoreVerifiableCredentials
 
             try
             {
-                //the id is the state value initially created when the issuanc request was requested from the request API
-                //the in-memory database uses this as key to get and store the state of the process so the UI can be updated
+                // The id is the state value initially created when the presentation request was requested from the request API
+                // The in-memory database uses this as key to get and store the state of the process so the UI can be updated
                 string state = this.Request.Query["id"];
                 if (string.IsNullOrEmpty(state))
                 {
@@ -286,8 +271,8 @@ namespace AspNetCoreVerifiableCredentials
                     .Build();
             }
 
-            //configure in memory cache for the access tokens. The tokens are typically valid for 60 seconds,
-            //so no need to create new ones for every web request
+            // Configure in memory cache for the access tokens. The tokens are typically valid for 60 seconds,
+            // so no need to create new ones for every web request
             app.AddDistributedTokenCache(services =>
             {
                 services.AddDistributedMemoryCache();

@@ -24,8 +24,6 @@ namespace AspNetCoreVerifiableCredentials
     [ApiController]
     public class IssuerController : ControllerBase
     {
-        const string ISSUANCEPAYLOAD = "issuance_request_config.json";
-
         protected readonly AppSettingsModel AppSettings;
         protected IMemoryCache _cache;
         protected readonly ILogger<IssuerController> _log;
@@ -48,96 +46,70 @@ namespace AspNetCoreVerifiableCredentials
         {
             try
             {
-                //they payload template is loaded from disk and modified in the code below to make it easier to get started
-                //and having all config in a central location appsettings.json. 
-                //if you want to manually change the payload in the json file make sure you comment out the code below which will modify it automatically
-                //
-                string jsonString = null;
+                int pinLength = 4;
                 string newpin = null;
 
-                string payloadpath = Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetEntryAssembly().Location), ISSUANCEPAYLOAD);
-                _log.LogTrace("IssuanceRequest file: {0}", payloadpath);
-                if (!System.IO.File.Exists(payloadpath))
+                // Check if PIN code is required. If required set a random PIN code
+                // PIN code is only used when the payload contains claim value pairs which results in an ID token hint
+                IssuanceRequestModel payload = new IssuanceRequestModel();
+
+
+                // The state is used to be able to update the UI when callbacks are received from the VC Service
+                payload.Callback.State = Guid.NewGuid().ToString();
+
+                // Get the IssuerDID from the appsettings
+                payload.Authority = AppSettings.IssuerAuthority;
+
+                // Localhost hostname can't work for callbacks so we won't overwrite it.
+                // This happens for example when testing with sign-in to an IDP and https://localhost is used as redirect URI.
+                // In that case the callback should be configured in the payload directly instead of being modified in the code here
+                string host = GetRequestHostName();
+                if (!host.Contains("//localhost"))
                 {
-                    _log.LogError("File not found: {0}", payloadpath);
-                    return BadRequest(new { error = "400", error_description = ISSUANCEPAYLOAD + " not found" });
-                }
-                jsonString = System.IO.File.ReadAllText(payloadpath);
-                if (string.IsNullOrEmpty(jsonString))
-                {
-                    _log.LogError("Error reading file: {0}", payloadpath);
-                    return BadRequest(new { error = "400", error_description = ISSUANCEPAYLOAD + " error reading file" });
+                    payload.Callback.Url = String.Format("{0}:/api/issuer/issuanceCallback", host);
                 }
 
-                //check if pin is required, if found make sure we set a new random pin
-                //pincode is only used when the payload contains claim value pairs which results in an IDTokenhint
-                JObject payload = JObject.Parse(jsonString);
-                if (payload["issuance"]["pin"] != null)
+                // Get the manifest from the appsettings. This is the URL to the credential created in the azure portal. 
+                // The display and rules files to create the credential card can be found in the credentialfiles directory.
+                // Make sure the credential type in the issuance payload matches with the rules file. For this sample it should be VerifiedCredentialExpert
+                payload.Issuance.Manifest = AppSettings.CredentialManifest;
+                payload.Issuance.Type = AppSettings.CredentialType;
+
+                // Add the registration information
+                payload.Registration.ClientName = "111Verifiable Credential Expert Sample";
+
+                // For ID token hint flow, set the claims to pass to the wallet.
+                // Other flows such as OpenID Connect identity provider, and self-asserted can't pass claims
+                payload.Issuance.Claims = new IssuanceRequestClaims();
+                payload.Issuance.Claims.email = "megan.b@fabrikam.com";
+                payload.Issuance.Claims.given_name = "Megan";
+                payload.Issuance.Claims.family_name = "Bowen";
+
+                //  Add PIN code only if the issuer passes claims to the wallet (ID token hint)
+                if (payload.Issuance.Claims != null)
                 {
                     if (IsMobile())
                     {
-                        _log.LogTrace("pin element found in JSON payload, but on mobile so remove pin since we will be using deeplinking");
-                        //consider providing the PIN through other means to your user instead of removing it.
-                        payload["issuance"]["pin"].Parent.Remove();
-
+                        _log.LogTrace("The PIN code is required, but on mobile so use deeplinking instead");
+                        // Consider providing the PIN through other means to your user instead of removing it.
                     }
                     else
                     {
                         _log.LogTrace("pin element found in JSON payload, modifying to a random number of the specific length");
-                        var length = (int)payload["issuance"]["pin"]["length"];
-                        var pinMaxValue = (int)Math.Pow(10, length) - 1;
+                        var pinMaxValue = (int)Math.Pow(10, pinLength) - 1;
                         var randomNumber = RandomNumberGenerator.GetInt32(1, pinMaxValue);
-                        newpin = string.Format("{0:D" + length.ToString() + "}", randomNumber);
-                        payload["issuance"]["pin"]["value"] = newpin;
+                        newpin = string.Format("{0:D" + pinLength.ToString() + "}", randomNumber);
+
+                        payload.Issuance.PIN = new PinType()
+                        {
+                            Length = pinLength,
+                            Value = newpin
+                        };
                     }
 
                 }
 
-                string state = Guid.NewGuid().ToString();
-
-                //modify payload with new state, the state is used to be able to update the UI when callbacks are received from the VC Service
-                if (payload["callback"]["state"] != null)
-                {
-                    payload["callback"]["state"] = state;
-                }
-
-                //get the IssuerDID from the appsettings
-                if (payload["authority"] != null)
-                {
-                    payload["authority"] = AppSettings.IssuerAuthority;
-                }
-
-                //modify the callback method to make it easier to debug 
-                //with tools like ngrok since the URI changes all the time
-                //this way you don't need to modify the callback URL in the payload every time
-                //ngrok changes the URI
-
-                if (payload["callback"]["url"] != null)
-                {
-                    //localhost hostname can't work for callbacks so we won't overwrite it.
-                    //this happens for example when testing with sign-in to an IDP and https://localhost is used as redirect URI
-                    //in that case the callback should be configured in the payload directly instead of being modified in the code here
-                    string host = GetRequestHostName();
-                    if (!host.Contains("//localhost"))
-                    {
-                        payload["callback"]["url"] = String.Format("{0}:/api/issuer/issuanceCallback", host);
-                    }
-                }
-
-                //get the manifest from the appsettings, this is the URL to the credential created in the azure portal. 
-                //the display and rules file to create the credential can be dound in the credentialfiles directory
-                //make sure the credentialtype in the issuance payload matches with the rules file
-                //for this sample it should be VerifiedCredentialExpert
-                if (payload["issuance"]["manifest"] != null)
-                {
-                    payload["issuance"]["manifest"] = AppSettings.CredentialManifest;
-                }
-
-                //here you could change the payload manifest and change the firstname and lastname
-                payload["issuance"]["claims"]["given_name"] = "Megan";
-                payload["issuance"]["claims"]["family_name"] = "Bowen";
-
-                jsonString = JsonConvert.SerializeObject(payload);
+                string jsonString = JsonConvert.SerializeObject(payload);
 
                 //CALL REST API WITH PAYLOAD
                 HttpStatusCode statusCode = HttpStatusCode.OK;
@@ -145,7 +117,7 @@ namespace AspNetCoreVerifiableCredentials
 
                 try
                 {
-                    //The VC Request API is an authenticated API. We need to clientid and secret (or certificate) to create an access token which 
+                    //The VC Request API is an authenticated API. We need to client ID and secret (or certificate) to create an access token which 
                     //needs to be send as bearer to the VC Request API
                     var accessToken = await GetAccessToken();
                     if (accessToken.Item1 == String.Empty)
@@ -164,10 +136,10 @@ namespace AspNetCoreVerifiableCredentials
 
                     if (statusCode == HttpStatusCode.Created)
                     {
-                        _log.LogTrace("succesfully called Request API");
+                        _log.LogTrace("Successfully called Request API");
                         JObject requestConfig = JObject.Parse(response);
                         if (newpin != null) { requestConfig["pin"] = newpin; }
-                        requestConfig.Add(new JProperty("id", state));
+                        requestConfig.Add(new JProperty("id", payload.Callback.State));
                         jsonString = JsonConvert.SerializeObject(requestConfig);
 
                         //We use in memory cache to keep state about the request. The UI will check the state when calling the presentationResponse method
@@ -178,13 +150,13 @@ namespace AspNetCoreVerifiableCredentials
                             message = "Request ready, please scan with Authenticator",
                             expiry = requestConfig["expiry"].ToString()
                         };
-                        _cache.Set(state, JsonConvert.SerializeObject(cacheData));
+                        _cache.Set(payload.Callback.State, JsonConvert.SerializeObject(cacheData));
 
                         return new ContentResult { ContentType = "application/json", Content = jsonString };
                     }
                     else
                     {
-                        _log.LogError("Unsuccesfully called Request API");
+                        _log.LogError("Unsuccessfully called Request API");
                         return BadRequest(new { error = "400", error_description = "Something went wrong calling the API: " + response });
                     }
 
@@ -268,7 +240,7 @@ namespace AspNetCoreVerifiableCredentials
 
         //
         //this function is called from the UI polling for a response from the AAD VC Service.
-        //when a callback is recieved at the issuanceCallback service the session will be updated
+        //when a callback is received at the issuanceCallback service the session will be updated
         //this method will respond with the status so the UI can reflect if the QR code was scanned and with the result of the issuance process
         //
         [HttpGet("/api/issuer/issuance-response")]
@@ -276,7 +248,7 @@ namespace AspNetCoreVerifiableCredentials
         {
             try
             {
-                //the id is the state value initially created when the issuanc request was requested from the request API
+                //the id is the state value initially created when the issuance request was requested from the request API
                 //the in-memory database uses this as key to get and store the state of the process so the UI can be updated
                 string state = this.Request.Query["id"];
                 if (string.IsNullOrEmpty(state))
